@@ -1,0 +1,148 @@
+import os
+import io
+import sys
+import base64
+import numpy as np
+import cv2
+from PIL import Image
+from flask import Flask, render_template, request, jsonify
+
+# Add src to path if running from root
+sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+
+try:
+    import tensorflow as tf
+    try:
+        from src.grad_cam import GradCAM
+    except ImportError:
+        from grad_cam import GradCAM
+    TF_AVAILABLE = True
+except ImportError:
+    print("TensorFlow not found. Running in UI-only mode with dummy predictions.")
+    TF_AVAILABLE = False
+
+
+app = Flask(__name__)
+
+# Constants
+MODEL_PATH = 'models/best_model.h5'
+CLASSES = ['Actinic keratoses (akiec)', 'Basal cell carcinoma (bcc)', 
+           'Benign keratosis-like lesions (bkl)', 'Dermatofibroma (df)', 
+           'Melanoma (mel)', 'Melanocytic nevi (nv)', 'Vascular lesions (vasc)']
+IMG_SIZE = (224, 224)
+
+# Load model globally
+model = None
+
+
+def load_cached_model():
+    global model
+    if model is None:
+        if not TF_AVAILABLE:
+            print("Using dummy model")
+            class DummyModel:
+                def predict(self, x):
+                    dummy_preds = np.zeros((1, len(CLASSES)))
+                    dummy_preds[0][0] = 0.95
+                    return dummy_preds
+            model = DummyModel()
+            return model
+            
+        if os.path.exists(MODEL_PATH):
+            print(f"Loading model from {MODEL_PATH}")
+            model = tf.keras.models.load_model(MODEL_PATH)
+        else:
+            print("Model not found. Please run src/generate_dummy_model.py or train a model.")
+    return model
+
+
+def prepare_image(img_bytes):
+    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    img_orig = np.array(img)
+    
+    img = img.resize(IMG_SIZE)
+    if TF_AVAILABLE:
+        img_array = tf.keras.preprocessing.image.img_to_array(img)
+    else:
+        img_array = np.array(img, dtype=np.float32)
+    
+    # Preprocessing expected by EfficientNetV2 is handled internally, 
+    # but we need batch dimension
+    img_array = np.expand_dims(img_array, axis=0)
+    
+    # Original image resized for GradCAM overlay
+    img_orig_resized = cv2.resize(img_orig, IMG_SIZE) if 'cv2' in sys.modules else np.array(img.resize(IMG_SIZE))
+    
+    return img_array, img_orig_resized
+
+
+def encode_image_to_base64(img_array):
+    img = Image.fromarray(img_array)
+    buffered = io.BytesIO()
+    img.save(buffered, format="JPEG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return img_str
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image uploaded'})
+            
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'})
+            
+        img_bytes = file.read()
+
+        model = load_cached_model()
+        if model is None:
+            return jsonify({'error': 'Model not loaded. Server error.'})
+            
+        # Prepare image
+        processed_img, orig_img = prepare_image(img_bytes)
+        
+        # Predict
+        preds = model.predict(processed_img)[0] if TF_AVAILABLE else model.predict(processed_img)[0]
+        class_idx = np.argmax(preds)
+        confidence = float(preds[class_idx])
+        pred_class = CLASSES[class_idx]
+        
+        # Generate Grad-CAM
+        try:
+            if TF_AVAILABLE:
+                cam = GradCAM(model, class_idx)
+                heatmap = cam.compute_heatmap(processed_img)
+                overlay = cam.overlay_heatmap(heatmap, orig_img)
+                
+                # Encode overlay to base64
+                heatmap_b64 = encode_image_to_base64(overlay)
+            else:
+                heatmap_b64 = encode_image_to_base64(orig_img) # Return original image as dummy heatmap
+        except Exception as e:
+            print(f"GradCAM error: {e}")
+            heatmap_b64 = None
+            
+        return jsonify({
+            'success': True,
+            'prediction': pred_class,
+            'confidence': f"{confidence:.2%}",
+            'heatmap': heatmap_b64
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+if __name__ == '__main__':
+    # Initialize model on startup
+    load_cached_model()
+    
+    # Run the app locally
+    app.run(port=5000, debug=True, use_reloader=False)
